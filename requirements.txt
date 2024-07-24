@@ -1,0 +1,7 @@
+torch
+torchvision
+numpy==1.26.0
+pandas
+matplotlib
+ipykernel
+scipy
