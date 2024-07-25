@@ -10,7 +10,7 @@ from torch.optim.lr_scheduler import LambdaLR
 import math
 import logging
 
-logging.basicConfig(format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S', level=logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S', level=logging.INFO, filename= 'train.log', filemode = 'w')
 logger = logging.getLogger(__name__)
 
 IMG_SIZE = 128
@@ -289,8 +289,9 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item()
+        logger.info(f"step {step}/{len(data_loader)} , loss {loss.item()}")
     lr = optimizer.param_groups[0]['lr']
-    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss/len(data_loader)}, LR: {lr}")
+    logger.info(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss/len(data_loader)}, LR: {lr}")
     
     with torch.no_grad():
         images, _ = next(iter(data_loader))
@@ -301,6 +302,6 @@ for epoch in range(num_epochs):
         loss = criterion(outputs, noise)
         psnr = PSNR(loss)
         ssim_val = ssim(outputs, noise)
-        print(f"EPOCH {epoch+1}/{num_epochs}, PSNR: {psnr}, SSIM: {ssim_val}")
+        logger.info(f"EPOCH {epoch+1}/{num_epochs}, PSNR: {psnr}, SSIM: {ssim_val}")
     
     sample_plot_image(model, T, epoch)
