@@ -8,14 +8,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 from torch.optim.lr_scheduler import LambdaLR
 import math
+import logging
 
-IMG_Size = 128
+logging.basicConfig(format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+IMG_SIZE = 128
 Batch_size = 128
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+logger.info(f"Image Size: {IMG_SIZE}")
+logger.info(f"Device: {device}")
+
 def load_transformed_dataset():
     data_transform = transforms.Compose([
-        transforms.Resize((IMG_Size, IMG_Size)),
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(), # transforms to between 0 and 1
         transforms.Lambda(lambda x: x * 2 - 1) # transforms to between -1 and 1
@@ -44,32 +51,45 @@ def show_tensor_image(image):
 data = load_transformed_dataset()
 data_loader = DataLoader(data, batch_size=Batch_size, shuffle=True)
 
+logger.info(f" Data set Loaded, Number of images: {len(data)}, Number of batches of size {Batch_size}: {len(data_loader)}")
+
 def linear_beta_scheduler(timesteps,start = 0.0001, end = 0.02):
     return torch.linspace(start, end, timesteps)
+
+def tanh_beta_scheduler(timesteps, start = 0.0001, end = 0.02):
+    return torch.tensor([start + (end - start) * 0.5 * (1 + math.tanh(4 * (t / timesteps - 0.5))) for t in range(timesteps)])
+
+def cosine_beta_scheduler(timesteps, start = 0.0001, end = 0.02):
+    return torch.tensor([start + (end - start) * 0.5 * (1 + math.cos(math.pi * t / timesteps)) for t in range(timesteps)])
 
 def get_index_from_list(vals, t, x_shape):
     batch_size = t.shape[0]
     out = vals.gather(-1, t.cpu())
     return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
 
-def forward_diffusion_sample(x_0, t, device="cpu"):
+def get_alpha_coeffs(betas):
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, axis = 0)
+    alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0) # prepend 1.0 and remove last element
+    sqrt_recip_alphas = torch.sqrt(1.0 / alphas)
+    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+    sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+    posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas)
+    return sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, sqrt_recip_alphas, posterior_variance
+    
+T = 200
+betas = tanh_beta_scheduler(T)
+sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, sqrt_recip_alphas, posterior_variance = get_alpha_coeffs(betas)
+
+logger.info(f"Number of timesteps: {T} with tanh beta scheduler")
+
+def forward_diffusion_sample(x_0, t, device="cpu", sqrt_alphas_cumprod=sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod=sqrt_one_minus_alphas_cumprod):
     noise = torch.randn_like(x_0).to(device)
     mean_coeff = get_index_from_list(sqrt_alphas_cumprod, t, x_0.shape).to(device)
     var_coeff = get_index_from_list(sqrt_one_minus_alphas_cumprod, t, x_0.shape).to(device)
     mean = mean_coeff * x_0.to(device)
     var = var_coeff * noise
     return mean + var, noise
-
-T = 200
-betas = linear_beta_scheduler(T)
-
-alphas = 1.0 - betas
-alphas_cumprod = torch.cumprod(alphas, axis = 0)
-alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0) # prepend 1.0 and remove last element
-sqrt_recip_alphas = torch.sqrt(1.0 / alphas)
-sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
-sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
-posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas)
 
 def init_weights(module):
     if isinstance(module, nn.Conv2d):
@@ -83,113 +103,83 @@ def init_weights(module):
         nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
         if module.bias is not None:
             nn.init.constant_(module.bias, 0)
-
-class EncoderBlock(nn.Module):
-    def __init__(self, in_channels, features, name):
-        super(EncoderBlock, self).__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=features,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(num_features=features),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(
-                in_channels=features,
-                out_channels=features,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(num_features=features),
-            nn.ReLU(inplace=True),
-        )
-        self.name = name
-
-    def forward(self, x):
-        return self.block(x)
-
-class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, features, name):
-        super(DecoderBlock, self).__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=features,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(num_features=features),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(
-                in_channels=features,
-                out_channels=features,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(num_features=features),
-            nn.ReLU(inplace=True),
-        )
-        self.name = name
-
-    def forward(self, x):
-        return self.block(x)
-
+            
+class Block(nn.Module):
+    def __init__(self, in_channels, out_channels, time_emb_dim, up = False, name = None):
+        super(Block, self).__init__()
+        self.time_mlp = nn.Linear(time_emb_dim, out_channels)
+        if up:
+            self.conv1 = nn.Conv2d(2*in_channels, out_channels, kernel_size=3, padding=1)
+            self.transform = nn.ConvTranspose2d(out_channels, out_channels, kernel_size = 4, stride = 2, padding = 1)
+        else:
+            self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+            self.transform = nn.Conv2d(out_channels, out_channels, kernel_size = 4, stride = 2, padding = 1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.bnorm = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, x, t, ):
+        h = self.bnorm(self.relu(self.conv1(x)))
+        
+        time_emb = self.relu(self.time_mlp(t))
+        time_emb = time_emb[:, :, None, None].repeat(1, 1, x.shape[2], x.shape[3])
+        
+        h = h + time_emb
+        h = self.bnorm(self.relu(self.conv2(h)))
+        
+        return self.transform(h)
+        
+class SinusoidalPositionalEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
+    
 class UNet(nn.Module):
-    def __init__(self, in_channels, out_channels, init_features=32):
+    def __init__(self):
         super(UNet, self).__init__()
-        features = init_features
-        self.encoder1 = EncoderBlock(in_channels, features, name="enc1")
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.encoder2 = EncoderBlock(features, features * 2, name="enc2")
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.encoder3 = EncoderBlock(features * 2, features * 4, name="enc3")
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.encoder4 = EncoderBlock(features * 4, features * 8, name="enc4")
-        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+        image_size = IMG_SIZE
+        image_channels = 3
+        down_channels = (64, 128, 256, 512, 1024)
+        up_channels = (1024, 512, 256, 128, 64)
+        out_dim = 1
+        time_emb_dim = 32
         
-        self.bottleneck = EncoderBlock(features * 8, features * 16, name="bottleneck")
+        self.time_mlp = nn.Sequential(
+            SinusoidalPositionalEmbedding(time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.ReLU(),
+        )
         
-        self.upconv4 = nn.ConvTranspose2d(features * 16, features * 8, kernel_size=2, stride=2)
-        self.decoder4 = DecoderBlock((features * 8) * 2, features * 8, name="dec4")
-        self.upconv3 = nn.ConvTranspose2d(features * 8, features * 4, kernel_size=2, stride=2)
-        self.decoder3 = DecoderBlock((features * 4) * 2, features * 4, name="dec3")
-        self.upconv2 = nn.ConvTranspose2d(features * 4, features * 2, kernel_size=2, stride=2)
-        self.decoder2 = DecoderBlock((features * 2) * 2, features * 2, name="dec2")
-        self.upconv1 = nn.ConvTranspose2d(features * 2, features, kernel_size=2, stride=2)
-        self.decoder1 = DecoderBlock(features * 2, features, name="dec1")
+        self.conv0 = nn.Conv2d(image_channels, down_channels[0], kernel_size=3, padding=1)
         
-        self.conv = nn.Conv2d(in_channels=features, out_channels=out_channels, kernel_size=1)
+        self.downs = nn.ModuleList([Block(down_channels[i], down_channels[i+1], time_emb_dim) for i in range(len(down_channels) - 1)])
+        self.ups = nn.ModuleList([Block(up_channels[i], up_channels[i+1], time_emb_dim, up=True) for i in range(len(up_channels) - 1)])
         
+        self.output = nn.Conv2d(up_channels[-1], 3, out_dim)
         self.apply(init_weights)
     
-    def forward(self, x):
-        enc1 = self.encoder1(x)
-        enc2 = self.encoder2(self.pool1(enc1))
-        enc3 = self.encoder3(self.pool2(enc2))
-        enc4 = self.encoder4(self.pool3(enc3))
-        
-        bottleneck = self.bottleneck(self.pool4(enc4))
-        
-        dec4 = self.upconv4(bottleneck)
-        dec4 = torch.cat((dec4, enc4), dim=1)
-        dec4 = self.decoder4(dec4)
-        dec3 = self.upconv3(dec4)
-        dec3 = torch.cat((dec3, enc3), dim=1)
-        dec3 = self.decoder3(dec3)
-        dec2 = self.upconv2(dec3)
-        dec2 = torch.cat((dec2, enc2), dim=1)
-        dec2 = self.decoder2(dec2)
-        dec1 = self.upconv1(dec2)
-        dec1 = torch.cat((dec1, enc1), dim=1)
-        dec1 = self.decoder1(dec1)
-        
-        return self.conv(dec1)
+    def forward(self, x, timestep):
+        t = self.time_mlp(timestep)
+        x = self.conv0(x)
+        residual_inputs = []
+        for down in self.downs:
+            x = down(x, t)
+            residual_inputs.append(x)
+        for up in self.ups:
+            residual_x = residual_inputs.pop()
+            x = torch.cat([x, residual_x], dim=1)
+            x = up(x, t)
+        return self.output(x)
 
 def PSNR(loss):
     return 10 * torch.log10(4.0 / torch.sqrt(loss))
@@ -238,39 +228,77 @@ def exponential_decay_lr_scheduler(optimizer, decay_rate, epoch):
         return math.exp(-decay_rate * epoch)
     return LambdaLR(optimizer, lr_lambda)
 
-model = UNet(in_channels=3, out_channels=3)
-model.to(device)
+@torch.no_grad()
+def backward_diffusion_sample(x_T, t, model, betas=betas, sqrt_one_minus_alphas_cumprod=sqrt_one_minus_alphas_cumprod, sqrt_recip_alphas=sqrt_recip_alphas, posterior_variance=posterior_variance):
+    device = model.device
+    x_T = x_T.to(device)
+    betas_t = get_index_from_list(betas, t, x_T.shape).to(device)
+    sqrt_one_minus_alphas_cumprod_t = get_index_from_list(sqrt_one_minus_alphas_cumprod, t, x_T.shape).to(device)
+    sqrt_recip_alphas_t = get_index_from_list(sqrt_recip_alphas, t, x_T.shape).to(device)
+    mean = sqrt_recip_alphas_t * ( x_T - betas_t * model(x_T, t) / sqrt_one_minus_alphas_cumprod_t )
+    posterior_variance_t = get_index_from_list(posterior_variance, t, x_T.shape).to(device)
+    if t == 0:
+        return mean
+    else:
+        noise = torch.randn_like(x_T).to(device)
+        return mean + posterior_variance_t * noise
+    
+@torch.no_grad()
+def sample_plot_image(model, T, epoch):
+    img = IMG_SIZE
+    img = torch.randn(1, 3, img, img)
+    plt.figure(figsize=(15, 15))
+    plt.axis = 'off'
+    num_images = 10
+    stepsize = int(T/num_images)
+    
+    for i in range(0, T)[::-1]:
+        t = torch.full((1,), i, dtype=torch.long)
+        img = backward_diffusion_sample(img, t, model)
+        if i % stepsize == 0:
+            plt.subplot(1, num_images, i // stepsize + 1)
+            show_tensor_image(img.detach().cpu()[0])
+    plt.savefig(f"epoch {epoch} samples.png")
 
-criterion = nn.MSELoss().to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+model = UNet()
+model.to(device)
+num_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+logger.info(f"Number of parameters: {num_parameters}")
+logger.info(f"Model: {model}")
+
+criterion = nn.L1Loss().to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-6)
 decay_rate = 0.1
 scheduler = exponential_decay_lr_scheduler(optimizer, decay_rate, epoch=0)
 num_epochs = 1
+model_path = "model.pth"
+logger.info(f"model stored at: {model_path}")
+logger.info(f"Number of epochs: {num_epochs}")
+logger.info(f"Optimizer: AdamW, Weight Decay: 1e-6, LR: 1e-3")
 
 for epoch in range(num_epochs):
     model.train()
     epoch_loss = 0
     for step, (images, _ ) in enumerate(data_loader):
-        noisy_images, noise = forward_diffusion_sample(images, torch.randint(0, T, (Batch_size,)), device)
+        t = torch.randint(0, T, (Batch_size,))
+        noisy_images, noise = forward_diffusion_sample(images, t, device, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod)
         optimizer.zero_grad()
-        outputs = model(noisy_images)
+        outputs = model(noisy_images, t)
         loss = criterion(outputs, noise)
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item()
-        if step % 10 == 0:
-            scheduler.step()
-            print(f"Epoch {epoch+1}/{num_epochs}, Step {step}/{len(data_loader)}, lr: {optimizer.param_groups[0]['lr']}")
-            model.eval()
-            
     lr = optimizer.param_groups[0]['lr']
     print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss/len(data_loader)}, LR: {lr}")
     
     with torch.no_grad():
         images, _ = next(iter(data_loader))
-        noisy_images, noise = forward_diffusion_sample(images, torch.randint(0, T, (Batch_size,)), device)
-        outputs = model(noisy_images)
+        t = torch.randint(0, T, (Batch_size,))
+        noisy_images, noise = forward_diffusion_sample(images, t, device, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod)
+        outputs = model(noisy_images, t)
         loss = criterion(outputs, noise)
         psnr = PSNR(loss)
         ssim_val = ssim(outputs, noise)
         print(f"EPOCH {epoch+1}/{num_epochs}, PSNR: {psnr}, SSIM: {ssim_val}")
+    
+    sample_plot_image(model, T, epoch)
