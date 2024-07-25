@@ -215,7 +215,7 @@ def ssim(img1, img2, window_size=11, window=None, size_average=True):
 def create_window(window_size, channel):
     def gaussian(window_size, sigma):
         window_size = torch.tensor(window_size)
-        gauss = torch.Tensor([torch.exp(-(x - window_size//2)**2/(2*sigma**2)) for x in range(window_size)])
+        gauss = torch.Tensor([torch.exp(-(x - window_size//2)**2/(2*sigma**2)) for x in range(window_size)], device=device)
         return gauss/gauss.sum()
 
     _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
@@ -246,14 +246,14 @@ def backward_diffusion_sample(x_T, t, model, betas=betas, sqrt_one_minus_alphas_
 @torch.no_grad()
 def sample_plot_image(model, T, epoch):
     img = IMG_SIZE
-    img = torch.randn(1, 3, img, img)
+    img = torch.randn(1, 3, img, img, device=device)
     plt.figure(figsize=(15, 15))
     plt.axis = 'off'
     num_images = 10
     stepsize = int(T/num_images)
     
     for i in range(0, T)[::-1]:
-        t = torch.full((1,), i, dtype=torch.long)
+        t = torch.full((1,), i, dtype=torch.long, device=device)
         img = backward_diffusion_sample(img, t, model)
         if i % stepsize == 0:
             plt.subplot(1, num_images, i // stepsize + 1)
@@ -280,7 +280,8 @@ for epoch in range(num_epochs):
     model.train()
     epoch_loss = 0
     for step, (images, _ ) in enumerate(data_loader):
-        t = torch.randint(0, T, (Batch_size,))
+        t = torch.randint(0, T, (Batch_size,), device=device)
+        images = images.to(device)
         noisy_images, noise = forward_diffusion_sample(images, t, device, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod)
         optimizer.zero_grad()
         outputs = model(noisy_images, t)
@@ -293,7 +294,8 @@ for epoch in range(num_epochs):
     
     with torch.no_grad():
         images, _ = next(iter(data_loader))
-        t = torch.randint(0, T, (Batch_size,))
+        t = torch.randint(0, T, (Batch_size,), device=device)
+        images = images.to(device)
         noisy_images, noise = forward_diffusion_sample(images, t, device, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod)
         outputs = model(noisy_images, t)
         loss = criterion(outputs, noise)
