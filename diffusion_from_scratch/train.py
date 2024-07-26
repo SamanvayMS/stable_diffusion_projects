@@ -9,6 +9,7 @@ import numpy as np
 from torch.optim.lr_scheduler import LambdaLR
 import math
 import logging
+import os
 
 logging.basicConfig(format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S', level=logging.INFO, filename= 'train.log', filemode = 'w')
 logger = logging.getLogger(__name__)
@@ -50,8 +51,8 @@ def show_tensor_image(image):
     
 data = load_transformed_dataset()
 data_loader = DataLoader(data, batch_size=Batch_size, shuffle=True)
-
-logger.info(f" Data set Loaded, Number of images: {len(data)}, Number of batches of size {Batch_size}: {len(data_loader)}")
+num_images = len(data)
+logger.info(f" Data set Loaded, Number of images: {num_images}, Number of batches of size {Batch_size}: {len(data_loader)}")
 
 def linear_beta_scheduler(timesteps,start = 0.0001, end = 0.02):
     return torch.linspace(start, end, timesteps)
@@ -105,7 +106,7 @@ def init_weights(module):
             nn.init.constant_(module.bias, 0)
             
 class Block(nn.Module):
-    def __init__(self, in_channels, out_channels, time_emb_dim, up = False, name = None):
+    def __init__(self, in_channels, out_channels, time_emb_dim, up = False):
         super(Block, self).__init__()
         self.time_mlp = nn.Linear(time_emb_dim, out_channels)
         if up:
@@ -115,19 +116,17 @@ class Block(nn.Module):
             self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
             self.transform = nn.Conv2d(out_channels, out_channels, kernel_size = 4, stride = 2, padding = 1)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.bnorm = nn.BatchNorm2d(out_channels)
+        self.bnorm1 = nn.BatchNorm2d(out_channels)
+        self.bnorm2 = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
         
     def forward(self, x, t, ):
-        h = self.bnorm(self.relu(self.conv1(x)))
+        h = self.bnorm1(self.relu(self.conv1(x)))
         
         time_emb = self.relu(self.time_mlp(t))
-        time_emb = time_emb[:, :, None, None].repeat(1, 1, x.shape[2], x.shape[3])
-        
+        time_emb = time_emb[(...,) + (None,) * 2]
         h = h + time_emb
-        h = self.bnorm(self.relu(self.conv2(h)))
-        
+        h = self.bnorm2(self.relu(self.conv2(h)))
         return self.transform(h)
         
 class SinusoidalPositionalEmbedding(nn.Module):
@@ -151,7 +150,7 @@ class UNet(nn.Module):
         image_channels = 3
         down_channels = (64, 128, 256, 512, 1024)
         up_channels = (1024, 512, 256, 128, 64)
-        out_dim = 1
+        out_dim = 3
         time_emb_dim = 32
         
         self.time_mlp = nn.Sequential(
@@ -165,7 +164,7 @@ class UNet(nn.Module):
         self.downs = nn.ModuleList([Block(down_channels[i], down_channels[i+1], time_emb_dim) for i in range(len(down_channels) - 1)])
         self.ups = nn.ModuleList([Block(up_channels[i], up_channels[i+1], time_emb_dim, up=True) for i in range(len(up_channels) - 1)])
         
-        self.output = nn.Conv2d(up_channels[-1], 3, out_dim)
+        self.output = nn.Conv2d(up_channels[-1], out_dim, 1)
         self.apply(init_weights)
     
     def forward(self, x, timestep):
@@ -215,7 +214,7 @@ def ssim(img1, img2, window_size=11, window=None, size_average=True):
 def create_window(window_size, channel):
     def gaussian(window_size, sigma):
         window_size = torch.tensor(window_size)
-        gauss = torch.Tensor([torch.exp(-(x - window_size//2)**2/(2*sigma**2)) for x in range(window_size)], device=device)
+        gauss = torch.Tensor([torch.exp(-(x - window_size//2)**2/(2*sigma**2)) for x in range(window_size)])
         return gauss/gauss.sum()
 
     _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
@@ -223,43 +222,74 @@ def create_window(window_size, channel):
     window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
     return window
 
-def exponential_decay_lr_scheduler(optimizer, decay_rate, epoch):
+def exponential_decay_lr_scheduler(optimizer, decay_rate):
     def lr_lambda(epoch):
-        return math.exp(-decay_rate * epoch)
+        if epoch < 40:
+            return math.exp(-decay_rate * epoch)
+        else: return math.exp(-decay_rate * 40)
     return LambdaLR(optimizer, lr_lambda)
 
 @torch.no_grad()
 def backward_diffusion_sample(x_T, t, model, betas=betas, sqrt_one_minus_alphas_cumprod=sqrt_one_minus_alphas_cumprod, sqrt_recip_alphas=sqrt_recip_alphas, posterior_variance=posterior_variance):
-    device = model.device
-    x_T = x_T.to(device)
-    betas_t = get_index_from_list(betas, t, x_T.shape).to(device)
-    sqrt_one_minus_alphas_cumprod_t = get_index_from_list(sqrt_one_minus_alphas_cumprod, t, x_T.shape).to(device)
-    sqrt_recip_alphas_t = get_index_from_list(sqrt_recip_alphas, t, x_T.shape).to(device)
+    betas_t = get_index_from_list(betas, t, x_T.shape)
+    sqrt_one_minus_alphas_cumprod_t = get_index_from_list(sqrt_one_minus_alphas_cumprod, t, x_T.shape)
+    sqrt_recip_alphas_t = get_index_from_list(sqrt_recip_alphas, t, x_T.shape)
     mean = sqrt_recip_alphas_t * ( x_T - betas_t * model(x_T, t) / sqrt_one_minus_alphas_cumprod_t )
-    posterior_variance_t = get_index_from_list(posterior_variance, t, x_T.shape).to(device)
+    posterior_variance_t = get_index_from_list(posterior_variance, t, x_T.shape)
     if t == 0:
         return mean
     else:
-        noise = torch.randn_like(x_T).to(device)
-        return mean + posterior_variance_t * noise
+        noise = torch.randn_like(x_T)
+        return mean + torch.sqrt(posterior_variance_t) * noise
     
 @torch.no_grad()
 def sample_plot_image(model, T, epoch):
     img = IMG_SIZE
     img = torch.randn(1, 3, img, img, device=device)
-    plt.figure(figsize=(15, 15))
+    plt.figure(figsize=(20, 3))
     plt.axis = 'off'
     num_images = 10
     stepsize = int(T/num_images)
     
+    for i in range(0,T)[::-1]:
+        t = torch.full((1,), i, device=device, dtype=torch.long)
+        img = backward_diffusion_sample(img, t, model)
+        # Edit: This is to maintain the natural range of the distribution
+        img = torch.clamp(img, -1.0, 1.0)
+        if i % stepsize == 0:
+            plt.subplot(1, num_images, int(i/stepsize)+1)
+            show_tensor_image(img.detach().cpu())
+    plt.tight_layout()
+    os.makedirs("samples", exist_ok=True)
+    plt.savefig(f"samples/epoch {epoch} samples.png")
+    
+def get_ssim_score(model, images, T):
+    t = torch.full((1,), T - 1, dtype=torch.long, device=device)
+    img , _ = forward_diffusion_sample(images, t, device, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod)
     for i in range(0, T)[::-1]:
         t = torch.full((1,), i, dtype=torch.long, device=device)
         img = backward_diffusion_sample(img, t, model)
-        if i % stepsize == 0:
-            plt.subplot(1, num_images, i // stepsize + 1)
-            show_tensor_image(img.detach().cpu()[0])
-    plt.savefig(f"epoch {epoch} samples.png")
+    return ssim(img.detach().cpu(), images.detach().cpu())
 
+def plot_combined_losses(step_losses, epoch_losses, steps_per_epoch=53):
+    fig, ax = plt.subplots(figsize=(20, 10))
+    
+    # Calculate the x-values for epoch losses, considering each epoch represents steps_per_epoch steps
+    x_epoch = np.arange(0, len(epoch_losses) * steps_per_epoch, steps_per_epoch) + steps_per_epoch // 2
+    
+    # Plot the step losses and epoch losses
+    ax.plot(np.log(step_losses), label='Step Losses (log scale)')
+    ax.plot(x_epoch, np.log(epoch_losses), label='Epoch Losses (log scale)', marker='o', linestyle='--')
+    
+    ax.set_title("Combined Step and Epoch Losses (log scale)")
+    ax.set_xlabel("Steps")
+    ax.set_ylabel("Losses (log)")
+    ax.legend()
+    
+    fig.tight_layout()
+    os.makedirs("samples", exist_ok=True)
+    fig.savefig("samples/combined_losses.png")
+    
 model = UNet()
 model.to(device)
 num_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -269,18 +299,22 @@ logger.info(f"Model: {model}")
 criterion = nn.L1Loss().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-6)
 decay_rate = 0.1
-scheduler = exponential_decay_lr_scheduler(optimizer, decay_rate, epoch=0)
-num_epochs = 1
+# scheduler = exponential_decay_lr_scheduler(optimizer, decay_rate)
+num_epochs = 100
 model_path = "model.pth"
 logger.info(f"model stored at: {model_path}")
 logger.info(f"Number of epochs: {num_epochs}")
 logger.info(f"Optimizer: AdamW, Weight Decay: 1e-6, LR: 1e-3")
 
+step_losses = []
+epoch_losses = []
+
 for epoch in range(num_epochs):
     model.train()
     epoch_loss = 0
     for step, (images, _ ) in enumerate(data_loader):
-        t = torch.randint(0, T, (Batch_size,), device=device)
+        size = images.size(0)
+        t = torch.randint(0, T, (size,), device=device)
         images = images.to(device)
         noisy_images, noise = forward_diffusion_sample(images, t, device, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod)
         optimizer.zero_grad()
@@ -289,19 +323,16 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item()
-        logger.info(f"step {step}/{len(data_loader)} , loss {loss.item()}")
+        step_losses.append(loss.item())
+    # scheduler.step()
     lr = optimizer.param_groups[0]['lr']
-    logger.info(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss/len(data_loader)}, LR: {lr}")
+    epoch_losses.append(epoch_loss/len(data_loader))
+    if (epoch + 1) % 10 == 0:
+        torch.save(model.state_dict(), model_path)
+        sample_plot_image(model, T, epoch)
+        plot_combined_losses(step_losses, epoch_losses, len(data_loader))
     
-    with torch.no_grad():
-        images, _ = next(iter(data_loader))
-        t = torch.randint(0, T, (Batch_size,), device=device)
-        images = images.to(device)
-        noisy_images, noise = forward_diffusion_sample(images, t, device, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod)
-        outputs = model(noisy_images, t)
-        loss = criterion(outputs, noise)
-        psnr = PSNR(loss)
-        ssim_val = ssim(outputs, noise)
-        logger.info(f"EPOCH {epoch+1}/{num_epochs}, PSNR: {psnr}, SSIM: {ssim_val}")
-    
-    sample_plot_image(model, T, epoch)
+    images = next(iter(data_loader))[0].to(device)
+    ssim_val = get_ssim_score(model, images, T)
+    psnr = PSNR(torch.tensor(epoch_loss/len(data_loader)))
+    logger.info(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss/len(data_loader)}, LR: {lr}, PSNR: {psnr} SSIM: {ssim_val}")
